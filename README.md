@@ -322,3 +322,40 @@ If you have a directory of per-family FASTA files and want to create `*.mapping`
 see:
 
 - `data_creation_scripts/fasta_to_text_memmap.py`
+
+
+# Experiment Log
+
+## Initial run 
+
+[4d2cea5](https://wandb.ai/ProFam/profam-supervised/runs/ijm5ap7s) — 2026-05-06
+
+- Training loss goes to zero
+- Val MSE on the "in prompt" values goes up at the start of starts at ~1.0 goes up to 1.6 after about 1k steps then back to 1.45 and plateus there
+- Val MSE on the final value does down from 1.9 to 1.75 and stays there
+- Val spearman goes to 0.15 after 2k steps and stays there, same for pearson but to 0.175
+- CE loss goes up but not a lot
+- Upshot: something useful is happening but the model is very bad
+
+## Cheating by leaking normalisation
+
+[0c32350](https://wandb.ai/ProFam/profam-supervised/runs/6n9rkqtv) — 2026-05-07
+
+- Added `use_full_assay_stats` flag to `ProteinGymICLDataset` that, when on, normalises labelled values and the query target using `(mu, sigma)` computed over the full per-assay DMS table (cached per assay), instead of the within-context z-score from the `k` labelled examples only.
+- Wired the flag through both ICL data configs and turned it on for the train and val datasets to run a "cheating" upper-bound experiment.
+- Goal: test the hypothesis that the within-context normalisation scheme was holding the ICL model back, by giving it the best-case per-assay statistics it could possibly see.
+- Result: training/validation behaviour was not qualitatively different from the standard within-context normalisation run — the cheating stats did not unlock noticeably better performance.
+- Implication: the current ICL underperformance is unlikely to be primarily caused by the choice of normalisation statistics; the bottleneck lives elsewhere (e.g. value featurisation, head capacity, context construction, or the loss / optimisation setup).
+
+## Cheating by observing the value
+
+[8a15259](https://wandb.ai/ProFam/profam-supervised/runs/qbl2cbn3) — 2026-05-07
+
+- Goal: sanity-check that the value embed/project pipeline (`value_in_proj` → hidden state → `value_out_head`) is wired up correctly end-to-end
+- Method: added a `cheat_loss_on_value_slot` flag to `LlamaICLLitModule` that shifts the MSE loss from the `[VAL]` position (where the model must predict `y` before seeing it) to the `[VAL_SLOT]` position (where `y` has just been injected via the input-embedding override)
+- Expectation: with the flag on, the model can trivially read `y` out of its own injected embedding via a learned linear map, so loss should crash and correlations should saturate
+- Result: confirmed — within ~100 gradient steps `val/mse_loss → 0`, `val/icl_all_spearman → 1`, and `val/icl_all_pearson → 1`
+- Note: `mse_loss_query` / `icl_query_*` are uninformative in cheat mode because the query position has no `[VAL_SLOT]` to land on, so only the `k` labelled positions contribute
+- Conclusion: the value embedding + projection machinery is functioning correctly; any failure to learn in the normal (non-cheat) regime is a representation/optimisation problem upstream of these two heads, not a bug in them
+
+
