@@ -20,8 +20,10 @@ trainer:
   devices: [2]
   strategy: auto
   num_nodes: 1
-  accumulate_grad_batches: 8
-  max_epochs: 100
+  accumulate_grad_batches: 16
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  max_epochs: 1000
   max_steps: 50000
   check_val_every_n_epoch: 1
   val_check_interval: 100
@@ -33,9 +35,9 @@ trainer:
 model:
   _target_: profam.models.llama_icl.LlamaICLLitModule
   scheduler_name: cosine_with_min_lr
-  num_warmup_steps: 1000
+  num_warmup_steps: 100
   num_training_steps: ${trainer.max_steps}
-  lr: 0.001
+  lr: 1e-4
   backbone_lr_scale: 1.0
   ce_loss_weight: 0.0
   mse_loss_weight: 1.0
