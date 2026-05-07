@@ -103,6 +103,7 @@ class LlamaICLLitModule(BaseFamilyLitModule):
         reinit_value_token_embeddings: bool = True,
         pretrained_ckpt_path: Optional[str] = None,
         pretrained_strict: bool = False,
+        cheat_loss_on_value_slot: bool = False,
     ) -> None:
         model = LlamaForCausalLM(config)
         super().__init__(
@@ -123,6 +124,7 @@ class LlamaICLLitModule(BaseFamilyLitModule):
         self.mse_loss_weight = float(mse_loss_weight)
         self.value_featurisation = value_featurisation
         self.backbone_lr_scale = float(backbone_lr_scale)
+        self.cheat_loss_on_value_slot = bool(cheat_loss_on_value_slot)
 
         hidden_size = config.hidden_size
         self.value_in_proj = _build_value_featuriser(
@@ -134,6 +136,7 @@ class LlamaICLLitModule(BaseFamilyLitModule):
         self.hparams["mse_loss_weight"] = self.mse_loss_weight
         self.hparams["value_featurisation"] = self.value_featurisation
         self.hparams["backbone_lr_scale"] = self.backbone_lr_scale
+        self.hparams["cheat_loss_on_value_slot"] = self.cheat_loss_on_value_slot
         self.hparams["optimizer"] = optimizer
 
         if pretrained_ckpt_path is not None:
@@ -313,6 +316,21 @@ class LlamaICLLitModule(BaseFamilyLitModule):
             "query_mask": query_mask,
         }
 
+    def _effective_predict_targets(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (predict_mask, target_values) honouring ``cheat_loss_on_value_slot``.
+
+        In cheat mode we score the hidden state at ``[VAL_SLOT]`` positions,
+        whose input embedding has just been replaced by ``W_in @ phi(y)``. The
+        out-head should then trivially recover ``y`` — a sanity check that the
+        value embed/project pipeline is wired up correctly. The query position
+        has no ``[VAL_SLOT]``, so it is excluded in cheat mode.
+        """
+        if self.cheat_loss_on_value_slot:
+            return batch["value_slot_mask"], batch["values"]
+        return batch["predict_mask"], batch["target_values"]
+
     def _shared_step(self, batch: Dict[str, torch.Tensor]):
         outputs = self(
             input_ids=batch["input_ids"],
@@ -324,10 +342,11 @@ class LlamaICLLitModule(BaseFamilyLitModule):
             target_values=batch["target_values"],
             labels=batch.get("labels"),
         )
+        predict_mask, target_values = self._effective_predict_targets(batch)
         return outputs, self._icl_loss(
             outputs,
-            predict_mask=batch["predict_mask"],
-            target_values=batch["target_values"],
+            predict_mask=predict_mask,
+            target_values=target_values,
         )
 
     def _diagnostic_stats(
@@ -343,9 +362,8 @@ class LlamaICLLitModule(BaseFamilyLitModule):
         """
         preds = loss_dict["preds"]
         device = preds.device
-        predict_mask = batch["predict_mask"]
+        predict_mask, target_values = self._effective_predict_targets(batch)
         value_slot_mask = batch.get("value_slot_mask")
-        target_values = batch["target_values"]
         B, L = predict_mask.shape
 
         n_predict = predict_mask.sum().to(torch.float32)
@@ -442,8 +460,7 @@ class LlamaICLLitModule(BaseFamilyLitModule):
         #    (multiple values per row). Requires >= 2 predict positions.
         try:
             preds = loss_dict["preds"]
-            predict_mask = batch["predict_mask"]
-            target_values = batch["target_values"]
+            predict_mask, target_values = self._effective_predict_targets(batch)
 
             query_mask = loss_dict["query_mask"]
             corr_logs: Dict[str, float] = {}

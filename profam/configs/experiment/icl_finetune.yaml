@@ -43,6 +43,11 @@ model:
   mse_loss_weight: 1.0
   value_featurisation: linear
   reinit_value_token_embeddings: true
+  # Diagnostic: when true, compute the loss at [VAL_SLOT] positions (where the
+  # embedded DMS score is visible to the model) instead of the preceding [VAL]
+  # position. This lets the model "cheat" and should drive MSE to ~0 quickly,
+  # confirming the value embed/project pipeline is wired up correctly.
+  cheat_loss_on_value_slot: false
   use_kv_cache_for_scoring: true
   pass_res_pos_in_doc_as_position_ids: true
   optimizer: adamw
