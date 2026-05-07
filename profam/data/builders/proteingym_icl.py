@@ -135,6 +135,7 @@ class ProteinGymICLDataset(Dataset):
         sigma_floor: float = 1e-3,
         max_completion_length: Optional[int] = None,
         tokenizer: Optional[ProFamTokenizer] = None,
+        use_full_assay_stats: bool = False,
     ):
         self.name = name
         self.split = split
@@ -149,6 +150,7 @@ class ProteinGymICLDataset(Dataset):
         self.document_token = document_token
         self.sigma_floor = float(sigma_floor)
         self._tokenizer = tokenizer
+        self.use_full_assay_stats = bool(use_full_assay_stats)
 
         if dms_ids is None:
             if split_csv is None:
@@ -178,6 +180,10 @@ class ProteinGymICLDataset(Dataset):
 
         # Per-assay in-memory cache for the (mutated_sequence, score) tables.
         self._assay_tables: Dict[str, pd.DataFrame] = {}
+        # Per-assay (mu, sigma) cache for full-dataset normalisation. Only
+        # populated when ``use_full_assay_stats=True``; values are computed
+        # lazily on first access from the full DMS table.
+        self._assay_stats: Dict[str, Tuple[float, float]] = {}
 
     # -- helpers -----------------------------------------------------------
 
@@ -203,6 +209,22 @@ class ProteinGymICLDataset(Dataset):
             )
             self._assay_tables[dms_id] = df
         return self._assay_tables[dms_id]
+
+    def _get_full_assay_stats(self, dms_id: str) -> Tuple[float, float]:
+        """Return (mu, sigma) computed from every score in the assay's DMS CSV.
+
+        This is the "cheating" normalisation: the query value participates in
+        ``mu``/``sigma``, so it cannot be used in any honest evaluation. It
+        exists to diagnose whether within-context standardisation is the thing
+        holding the ICL model back.
+        """
+        if dms_id not in self._assay_stats:
+            table = self._load_assay_table(dms_id)
+            scores = table["DMS_score"].to_numpy(dtype=np.float32)
+            self._assay_stats[dms_id] = standardise_context(
+                scores, sigma_floor=self.sigma_floor
+            )
+        return self._assay_stats[dms_id]
 
     def _tokenize_seq(self, seq: str) -> np.ndarray:
         """Encode a single AA string to token ids (no special tokens)."""
@@ -368,7 +390,10 @@ class ProteinGymICLDataset(Dataset):
         kept_labels = labels[keep_indices]
         query_label = float(labels[-1])
 
-        mu, sigma = standardise_context(kept_labels, sigma_floor=self.sigma_floor)
+        if self.use_full_assay_stats:
+            mu, sigma = self._get_full_assay_stats(dms_id)
+        else:
+            mu, sigma = standardise_context(kept_labels, sigma_floor=self.sigma_floor)
         labelled_values = (kept_labels - mu) / sigma
         query_target = (query_label - mu) / sigma
 

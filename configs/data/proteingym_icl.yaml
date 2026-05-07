@@ -13,6 +13,10 @@ train_dataset:
   samples_per_epoch: null
   document_token: '[RAW]'
   tokenizer: ${tokenizer}
+  # When true, normalise every (labelled value, query target) using mu/sigma
+  # computed over the full per-assay DMS table — the "cheating" upper bound
+  # for diagnosing the standardisation scheme.
+  use_full_assay_stats: false
 
 val_dataset:
   _target_: profam.data.builders.proteingym_icl.ProteinGymICLDataset
@@ -27,6 +31,7 @@ val_dataset:
   samples_per_epoch: null
   document_token: '[RAW]'
   tokenizer: ${tokenizer}
+  use_full_assay_stats: false
 
 tokenizer: ${tokenizer}
 batch_size: 1
