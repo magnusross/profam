@@ -422,6 +422,12 @@ _ICL_AUX_KEYS_BOOL = ("aa_mask", "value_slot_mask", "val_marker_mask", "predict_
 _ICL_AUX_KEYS_FLOAT = ("values", "target_values")
 _ICL_AUX_KEYS_INT = ("input_ids", "attention_mask")
 
+# 2-D per-document fields used by the model's zero-shot scoring sub-pass.
+# Each sample contributes (n_variants, variant_max_len) which can both vary
+# across the batch, so we pad on both dims.
+_ICL_VARIANT_KEY_INT = ("variant_token_ids", "variant_attn_mask")
+_ICL_VARIANT_KEY_BOOL_1D = ("variant_valid_mask",)
+
 
 class ICLDocumentBatchCollator(DocumentBatchCollator):
     """Collator for the supervised ICL fine-tune.
@@ -492,6 +498,54 @@ class ICLDocumentBatchCollator(DocumentBatchCollator):
                     pad_width = [(0, max_len - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
                     arr = np.pad(arr, pad_width, mode="constant", constant_values=fill)
                 d[key] = arr
+
+        # Pad the per-variant scoring fields. Each sample contributes a
+        # (n_var_i, var_len_i) array; we pad to (max_n_var, max_var_len)
+        # across the batch. ``variant_valid_mask`` (1-D, length n_var_i) gets
+        # padded to length max_n_var; padded entries are False so the model's
+        # scoring pass can ignore them.
+        pad_id = (
+            int(self.tokenizer.pad_token_id)
+            if self.tokenizer.pad_token_id is not None
+            else 0
+        )
+        if any("variant_token_ids" in d for d in non_string_data):
+            max_n_var = max(
+                int(np.asarray(d["variant_token_ids"]).shape[0])
+                for d in non_string_data
+                if "variant_token_ids" in d
+            )
+            max_var_len = max(
+                int(np.asarray(d["variant_token_ids"]).shape[1])
+                for d in non_string_data
+                if "variant_token_ids" in d
+            )
+            for d in non_string_data:
+                if "variant_token_ids" not in d:
+                    continue
+                fills_2d = {
+                    "variant_token_ids": (pad_id, np.int64),
+                    "variant_attn_mask": (0, np.int64),
+                }
+                for key, (fill, dtype) in fills_2d.items():
+                    arr = np.asarray(d[key], dtype=dtype)
+                    pad_n = max_n_var - arr.shape[0]
+                    pad_l = max_var_len - arr.shape[1]
+                    if pad_n or pad_l:
+                        arr = np.pad(
+                            arr,
+                            [(0, pad_n), (0, pad_l)],
+                            mode="constant",
+                            constant_values=fill,
+                        )
+                    d[key] = arr
+                vmask = np.asarray(d["variant_valid_mask"], dtype=bool)
+                pad_n = max_n_var - vmask.shape[0]
+                if pad_n:
+                    vmask = np.pad(
+                        vmask, [(0, pad_n)], mode="constant", constant_values=False
+                    )
+                d["variant_valid_mask"] = vmask
 
         try:
             batch = default_collate(non_string_data)

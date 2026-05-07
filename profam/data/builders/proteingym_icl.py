@@ -2,12 +2,18 @@
 
 Each ``__getitem__`` returns a single packed document of the form
 
-    [BOS] [DOC_TYPE] x_1 [VAL] [VAL_SLOT] [SEP] ... x_k [VAL] [VAL_SLOT] [SEP] x_q [VAL]
+    [BOS] [DOC_TYPE] x_1 [SEP] [VAL] [VAL_SLOT] ... x_k [SEP] [VAL] [VAL_SLOT] x_q [SEP] [VAL]
 
-together with a set of auxiliary tensors that the ICL model uses to
-substitute the embedded value at each ``[VAL_SLOT]`` and to compute the
-regression loss at each ``[VAL]`` position. See
+together with auxiliary tensors that the ICL model uses to (a) override the
+``[VAL_SLOT]`` input embedding with the labelled fitness y, (b) override the
+``[VAL]`` input embedding with the variant's zero-shot per-token
+log-likelihood (computed by the model in a no-grad sub-pass), and (c) read
+out a fitness regression at every ``[VAL]`` position. See
 ``profam/data/icl_constants.py`` for the token ids.
+
+The variant AA streams are also returned as a 2-D padded array
+(``variant_token_ids``, ``variant_attn_mask``, ``variant_valid_mask``) so the
+model can score them without having to slice them back out of the document.
 """
 
 from __future__ import annotations
@@ -237,10 +243,19 @@ class ProteinGymICLDataset(Dataset):
         ``seq_token_streams`` is length ``k+1`` and the *last* entry is the query.
         ``labelled_values`` are the standardised values for the first ``k`` examples.
         ``query_target_value`` is the standardised regression target for the query.
+
+        Per variant the layout is:
+
+            x_i [SEP] [VAL] [VAL_SLOT]      (labelled)
+            x_q [SEP] [VAL]                 (query)
+
+        The ``[SEP]`` precedes ``[VAL]`` so the model gets a stable signal that
+        the sequence has ended and a likelihood-conditioned prediction follows.
         """
         tok = self.tokenizer
         bos_id = int(tok.bos_token_id)
         sep_id = int(tok.sep_token_id)
+        pad_id = int(tok.pad_token_id)
         doc_id = int(tok.convert_tokens_to_ids(self.document_token))
 
         ids: List[int] = [bos_id, doc_id]
@@ -262,7 +277,19 @@ class ProteinGymICLDataset(Dataset):
                 target_values.append(0.0)
                 aa_mask.append(True)
 
-            # Append [VAL] marker for every example, including the query.
+            # Sequence end delimiter -> precedes the marker so the model knows
+            # "next token's embedding is the likelihood for the sequence above".
+            ids.append(sep_id)
+            value_slot_mask.append(False)
+            val_marker_mask.append(False)
+            predict_mask.append(False)
+            values.append(0.0)
+            target_values.append(0.0)
+            aa_mask.append(False)
+
+            # [VAL] marker for every example, including the query. Its input
+            # embedding will be overridden by the projected likelihood; its
+            # hidden state is the regression readout.
             ids.append(VAL_TOKEN_ID)
             value_slot_mask.append(False)
             val_marker_mask.append(True)
@@ -275,8 +302,8 @@ class ProteinGymICLDataset(Dataset):
             aa_mask.append(False)
 
             if i < k:
-                # Labelled example: append [VAL_SLOT] (its embedding is overridden
-                # at runtime) then [SEP].
+                # Labelled example: append [VAL_SLOT] (its input embedding is
+                # overridden at runtime by W_in @ phi(y)).
                 ids.append(VAL_SLOT_TOKEN_ID)
                 value_slot_mask.append(True)
                 val_marker_mask.append(False)
@@ -284,16 +311,26 @@ class ProteinGymICLDataset(Dataset):
                 values.append(float(labelled_values[i]))
                 target_values.append(0.0)
                 aa_mask.append(False)
+            # Query: nothing follows the trailing [VAL] - the prediction at
+            # that position depends only on what came before via causal mask.
 
-                ids.append(sep_id)
-                value_slot_mask.append(False)
-                val_marker_mask.append(False)
-                predict_mask.append(False)
-                values.append(0.0)
-                target_values.append(0.0)
-                aa_mask.append(False)
-            # Query: nothing follows the trailing [VAL] - causal mask makes the
-            # prediction at that position depend only on what came before.
+        # Build the per-variant 2-D AA stream used by the model's zero-shot
+        # scoring sub-pass. Layout per row: ``[BOS] [DOC_TYPE] aa_1 ... aa_n [SEP]``.
+        # The trailing ``[SEP]`` is included in the scored stream so the
+        # per-token mean log-likelihood also rewards the model for placing the
+        # sequence-end correctly. Start tokens mirror
+        # profam.models.base._score_seqs_no_context.
+        scoring_start_tokens = [bos_id, doc_id]
+        # +1 for the trailing [SEP] appended to every row.
+        scoring_lens = [len(s) + len(scoring_start_tokens) + 1 for s in seq_token_streams]
+        scoring_max = max(scoring_lens)
+        n_var = len(seq_token_streams)
+        variant_token_ids = np.full((n_var, scoring_max), pad_id, dtype=np.int64)
+        variant_attn_mask = np.zeros((n_var, scoring_max), dtype=np.int64)
+        for vi, seq_ids in enumerate(seq_token_streams):
+            row = scoring_start_tokens + seq_ids.tolist() + [sep_id]
+            variant_token_ids[vi, : len(row)] = row
+            variant_attn_mask[vi, : len(row)] = 1
 
         L = len(ids)
         return {
@@ -305,6 +342,9 @@ class ProteinGymICLDataset(Dataset):
             "predict_mask": np.asarray(predict_mask, dtype=bool),
             "values": np.asarray(values, dtype=np.float32),
             "target_values": np.asarray(target_values, dtype=np.float32),
+            "variant_token_ids": variant_token_ids,
+            "variant_attn_mask": variant_attn_mask,
+            "variant_valid_mask": np.ones(n_var, dtype=bool),
         }
 
     # -- main API ----------------------------------------------------------
@@ -323,9 +363,10 @@ class ProteinGymICLDataset(Dataset):
             )
 
         k = self._select_k(n, rng)
-        # Now budget for tokens: every variant contributes its own length plus
-        # 3 tokens (VAL + VAL_SLOT + SEP) for labelled examples, +1 (VAL) for the
-        # query, and 2 tokens (BOS + DOC_TYPE) of fixed overhead.
+        # Token budget per example: BOS + DOC_TYPE (2) of fixed overhead, then
+        # for each labelled variant len(seq) + 3 (SEP + VAL + VAL_SLOT) and for
+        # the query len(seq) + 2 (SEP + VAL). The token count is unchanged from
+        # the previous SP1/SP2/SEP layout - only the order changed.
         chosen_indices = rng.choice(n, size=k + 1, replace=False)
         seqs = [table.iloc[i]["mutated_sequence"] for i in chosen_indices]
         labels = np.asarray(
@@ -336,17 +377,16 @@ class ProteinGymICLDataset(Dataset):
 
         # Trim to fit the token budget if needed; always keep the query.
         budget = self.max_tokens_per_example - 2  # BOS + DOC_TYPE
-        # cost per example: len(seq_ids) + 3 (labelled) or +1 (query)
         keep_indices: List[int] = []  # indices into seqs
         # Always keep the query (last element) first.
-        query_cost = len(seq_token_streams[-1]) + 1
+        query_cost = len(seq_token_streams[-1]) + 2  # seq + SEP + VAL
         if query_cost > budget:
             raise RuntimeError(
                 f"Assay {dms_id}: query alone needs {query_cost} > {budget} tokens"
             )
         used = query_cost
         for i in range(len(seq_token_streams) - 1):
-            cost = len(seq_token_streams[i]) + 3
+            cost = len(seq_token_streams[i]) + 3  # seq + SEP + VAL + VAL_SLOT
             if used + cost > budget:
                 continue
             keep_indices.append(i)
