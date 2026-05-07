@@ -358,4 +358,19 @@ see:
 - Note: `mse_loss_query` / `icl_query_*` are uninformative in cheat mode because the query position has no `[VAL_SLOT]` to land on, so only the `k` labelled positions contribute
 - Conclusion: the value embedding + projection machinery is functioning correctly; any failure to learn in the normal (non-cheat) regime is a representation/optimisation problem upstream of these two heads, not a bug in them
 
+## Embedding the zero-shot likelihood as a feature
+
+[cc70124](https://wandb.ai/ProFam/profam-supervised/runs/kh79mfd4) — 2026-05-07
+
+- Goal: give the ICL model direct access to the per-sequence zero-shot log-likelihood as an additional input feature, on the hypothesis that anchoring the supervised head to the likelihood score would provide a strong starting point from which in-context learning could improve
+- Method: computed the zero-shot LL for each labelled and query sequence and embedded it alongside the value features, so the model sees `(sequence, ll, y)` for the labelled examples and `(sequence, ll)` for the query
+- Result on the validation set:
+  - `val/zero_shot_ll_spearman` starts around 0.27 and stays stable around 0.25 throughout training
+  - `val/icl_all_spearman` reaches 0.27 after ~72 steps — i.e. it matches but never surpasses the zero-shot baseline — then plateaus and slowly declines to ~0.18
+- Result on the training set:
+  - `train/zero_shot_ll_spearman` starts around 0.42 and remains noisy around that value throughout
+  - `train/icl_all_spearman` tracks the noisy zero-shot value closely for the first ~120 steps, then continues to rise to ~1.0 within 500 steps while the zero-shot signal stays flat
+- Interpretation: the supervised score initially learns to reproduce the likelihood score, and that behaviour does generalise to the val set (the model matches but does not beat the zero-shot baseline). Beyond that point, the only further gains are observed on training assays — the val ICL spearman plateaus and slightly declines while train ICL saturates at 1.0
+- Conclusion: we do not observe in-context learning or generalisable learning to held-out assays in this setup; the model memorises training assays once it has exhausted the likelihood-reproduction signal
+
 

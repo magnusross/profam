@@ -139,17 +139,16 @@ def test_permuting_context_examples_keeps_first_val_prediction_identical(
     # first [VAL] must not move.
     batch_b = {k: v.clone() for k, v in batch_a.items()}
 
-    # Identify the spans of x_2 and x_3 (third labelled example). We can find
-    # them by walking the val_slot_mask: each [VAL_SLOT] is preceded
-    # (immediately) by [VAL] which is preceded by exactly seq_len AA tokens.
+    # Identify the spans of x_2 and x_3 (third labelled example). With the
+    # ``aa... [SEP] [VAL] [VAL_SLOT]`` layout the next variant begins
+    # *immediately* after the [VAL_SLOT].
     val_slot_positions = torch.nonzero(
         batch_a["value_slot_mask"][0], as_tuple=False
     ).flatten().tolist()
     assert len(val_slot_positions) == 4
-    # x_2 starts after the first [SEP] (one position past first [VAL_SLOT]).
     seq_len = 5
-    x2_start = val_slot_positions[0] + 2  # +1 for [SEP], +0 for first AA
-    x3_start = val_slot_positions[1] + 2
+    x2_start = val_slot_positions[0] + 1
+    x3_start = val_slot_positions[1] + 1
     x2_slice = slice(x2_start, x2_start + seq_len)
     x3_slice = slice(x3_start, x3_start + seq_len)
     # Swap x2 and x3 token ids (and their attached labelled values).

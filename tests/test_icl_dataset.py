@@ -113,6 +113,9 @@ def test_dataset_token_layout(synthetic_gym_dir, profam_tokenizer):
         "predict_mask",
         "values",
         "target_values",
+        "variant_token_ids",
+        "variant_attn_mask",
+        "variant_valid_mask",
     }
     L = sample["input_ids"].shape[0]
     assert L >= 9 * 30 + 1  # 8 labelled + 1 query, 30 AAs each, plus markers
@@ -132,6 +135,34 @@ def test_dataset_token_layout(synthetic_gym_dir, profam_tokenizer):
     # Last [VAL] is the query: it should be the very last token.
     last_marker_pos = int(np.flatnonzero(sample["val_marker_mask"])[-1])
     assert last_marker_pos == L - 1, "Query [VAL] must be the final token"
+
+    # New layout: each [VAL] is immediately preceded by [SEP].
+    sep_id = profam_tokenizer.sep_token_id
+    val_positions = np.flatnonzero(sample["val_marker_mask"])
+    for p in val_positions:
+        assert sample["input_ids"][p - 1] == sep_id, (
+            f"[VAL] at position {p} must be preceded by [SEP]"
+        )
+
+    # Per-variant scoring fields: shape (k+1, max_var_len) and rows start with BOS, [RAW].
+    n_var, var_max_len = sample["variant_token_ids"].shape
+    assert n_var == 9
+    assert sample["variant_valid_mask"].shape == (9,)
+    assert sample["variant_valid_mask"].all()
+    bos_id = profam_tokenizer.bos_token_id
+    doc_id = profam_tokenizer.convert_tokens_to_ids("[RAW]")
+    sep_id = profam_tokenizer.sep_token_id
+    assert (sample["variant_token_ids"][:, 0] == bos_id).all()
+    assert (sample["variant_token_ids"][:, 1] == doc_id).all()
+    # Trailing [SEP] is the last non-pad token in every variant row.
+    valid_counts = sample["variant_attn_mask"].sum(axis=1)
+    for vi in range(n_var):
+        last_valid = int(valid_counts[vi]) - 1
+        assert sample["variant_token_ids"][vi, last_valid] == sep_id, (
+            f"variant {vi} should end with [SEP]"
+        )
+    # 30 AAs + BOS + DOC_TYPE + SEP = 33 tokens minimum per variant.
+    assert (valid_counts >= 33).all()
 
 
 def test_dataset_no_value_leakage(synthetic_gym_dir, profam_tokenizer):

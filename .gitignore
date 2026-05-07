@@ -58,7 +58,8 @@ out/
 evo_finetune_gym/
 model_checkpoints/profam-1/checkpoints/last.ckpt
 tests/test_min20_max90_mapping_alignment.py
-model_checkpoints/
 data/train_example/*/*.idx.info
 data/train_example/*/*.idx.npy
 data/score_sequences_example/*_weights.npz
+data/ProteinGym
+model_checkpoints
